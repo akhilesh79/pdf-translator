@@ -14,9 +14,7 @@ const router = express.Router();
 
 const UPLOAD_DIR = path.resolve('./uploads');
 const MAX_FILE_SIZE_MB = 50;
-// 'auto' => let Python run OSD on page 1 and pick the right Tesseract lang.
 const DEFAULT_OCR_LANG = 'auto';
-// Reject arbitrary user input — only lowercase letters, digits, underscore, plus.
 const LANG_RE = /^[a-z0-9_+]{2,40}$/;
 
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -55,7 +53,6 @@ const upload = multer({
   },
 });
 
-// Check PDF magic number ("%PDF-") to reject disguised non-PDF files.
 async function isValidPdf(buffer) {
   if (!buffer || buffer.length < 5) return false;
   return buffer.slice(0, 5).toString('ascii') === '%PDF-';
@@ -78,7 +75,7 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     if (buffer.length === 0) {
       return res.status(400).json({ success: false, error: 'Uploaded file is empty.' });
     }
-    if (!await isValidPdf(buffer)) {
+    if (!(await isValidPdf(buffer))) {
       return res.status(400).json({
         success: false,
         error: 'Uploaded file is not a valid PDF (missing %PDF- signature).',
@@ -114,7 +111,8 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     if (!text || text.trim().length === 0) {
       return res.status(422).json({
         success: false,
-        error: 'Could not extract any text. The PDF may be empty, image-only without OCR support, corrupt, or password-protected.',
+        error:
+          'Could not extract any text. The PDF may be empty, image-only without OCR support, corrupt, or password-protected.',
       });
     }
 
