@@ -125,8 +125,6 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     const payload = {
       success: true,
       sourceLanguage,
-      isScanned,
-      ocrLang: ocrLang || null,
       pageCount: pageCount || null,
       engine,
       originalText: text,
