@@ -4,7 +4,7 @@ const path = require('path');
 const PYTHON_SCRIPT = path.resolve(__dirname, 'pdf_extractor.py');
 const PYTHON_PATH = process.env.PYTHON_PATH
   || (process.platform === 'win32' ? 'python' : 'python3');
-const EXTRACTION_TIMEOUT_MS = parseInt(process.env.EXTRACTION_TIMEOUT_MS || '180000', 10);
+const EXTRACTION_TIMEOUT_MS = 180000; // 3 minutes
 
 function runPython(args) {
   return new Promise((resolve, reject) => {

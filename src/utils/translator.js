@@ -2,12 +2,9 @@ const axios = require('axios');
 
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 // MyMemory's free tier rejects q > 500 chars.
-const CHUNK_SIZE = Math.min(
-  parseInt(process.env.TRANSLATE_CHUNK_SIZE || '480', 10),
-  500,
-);
-const MAX_CONCURRENT_REQUESTS = parseInt(process.env.TRANSLATE_CONCURRENCY || '2', 10);
-const REQUEST_TIMEOUT_MS = parseInt(process.env.TRANSLATE_TIMEOUT_MS || '15000', 10);
+const CHUNK_SIZE = 480;
+const MAX_CONCURRENT_REQUESTS = 2;
+const REQUEST_TIMEOUT_MS = 15000;
 const MAX_ATTEMPTS = 4;
 
 if (!MYMEMORY_EMAIL) {

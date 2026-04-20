@@ -1,8 +1,8 @@
 const { LRUCache } = require('lru-cache');
 const crypto = require('crypto');
 
-const MAX_ITEMS = parseInt(process.env.CACHE_MAX_ITEMS || '100', 10);
-const TTL_MS = parseInt(process.env.CACHE_TTL_MS || String(1000 * 60 * 60 * 24), 10);
+const MAX_ITEMS = 100;
+const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 
 const cache = new LRUCache({ max: MAX_ITEMS, ttl: TTL_MS });
 

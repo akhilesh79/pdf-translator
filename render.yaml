@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pdf-translator
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: MYMEMORY_EMAIL
+        sync: false
+      - key: NODE_ENV
+        value: production

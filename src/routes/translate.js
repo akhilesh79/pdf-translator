@@ -12,10 +12,10 @@ const cache = require('../utils/translationCache');
 
 const router = express.Router();
 
-const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './uploads');
-const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '50', 10);
+const UPLOAD_DIR = path.resolve('./uploads');
+const MAX_FILE_SIZE_MB = 50;
 // 'auto' => let Python run OSD on page 1 and pick the right Tesseract lang.
-const DEFAULT_OCR_LANG = process.env.TESSERACT_LANGS || 'auto';
+const DEFAULT_OCR_LANG = 'auto';
 // Reject arbitrary user input — only lowercase letters, digits, underscore, plus.
 const LANG_RE = /^[a-z0-9_+]{2,40}$/;
 
