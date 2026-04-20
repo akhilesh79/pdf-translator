@@ -12,6 +12,30 @@ Upload a PDF in any language, get back the English translation. Handles both dig
 - **Quota-aware** — explicit `429 QUOTA_EXCEEDED` response when MyMemory's daily limit is reached
 - **English passthrough** — English source text skips the translation API entirely
 
+## Test PDFs
+
+The `test-pdfs/` folder contains sample PDF files used for testing the translation pipeline. These PDFs cover a variety of languages and formats, including:
+
+- Digital PDFs (with selectable text)
+- Scanned/image-based PDFs (requiring OCR)
+- Multilingual documents (e.g., Hindi, Arabic, Chinese, Japanese, Russian, etc.)
+- Mixed-script and multi-page PDFs
+
+These test files help verify:
+
+- Accurate text extraction (digital and scanned)
+- Correct language/script detection
+- Robustness of translation and error handling
+
+You can add your own PDFs to this folder for custom testing. Example datasets may include:
+
+- Public domain books in different languages
+- Government forms or certificates
+- Academic papers
+- Synthetic PDFs generated for edge cases
+
+**Note:** Do not include copyrighted or sensitive documents in this folder if sharing the repository.
+
 ## API
 
 ### `POST /api/translate`
