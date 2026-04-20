@@ -99,7 +99,7 @@ router.post('/', upload.single('pdf'), async (req, res) => {
       return res.json({
         ...cached,
         cached: true,
-        processingTimeMs: Date.now() - startTime,
+        processingTimeMs: Date.now() - startTime, 
       });
     }
 
