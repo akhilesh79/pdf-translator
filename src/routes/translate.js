@@ -83,7 +83,7 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     }
 
     // 1. Resolve OCR language: client override (form/query) > default (auto).
-    let ocrLangArg = (req.body && req.body.lang) || req.query.lang || DEFAULT_OCR_LANG;
+    let ocrLangArg = req.query.lang || DEFAULT_OCR_LANG;
     ocrLangArg = String(ocrLangArg).toLowerCase().trim();
     if (!LANG_RE.test(ocrLangArg)) {
       return res.status(400).json({
@@ -99,12 +99,12 @@ router.post('/', upload.single('pdf'), async (req, res) => {
       return res.json({
         ...cached,
         cached: true,
-        processingTimeMs: Date.now() - startTime, 
+        processingTimeMs: Date.now() - startTime,
       });
     }
 
     // 3. Extract. Python handles script detection via OSD when lang='auto'.
-    const { text, isScanned, pageCount, ocrLang } = await extractTextPython(filePath, {
+    const { text, isScanned, pageCount, ocrLang, detectedScript } = await extractTextPython(filePath, {
       lang: ocrLangArg,
     });
 
@@ -125,6 +125,9 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     const payload = {
       success: true,
       sourceLanguage,
+      isScanned: isScanned || false,
+      ocrLang: ocrLang || null,
+      detectedScript: detectedScript || null,
       pageCount: pageCount || null,
       engine,
       originalText: text,

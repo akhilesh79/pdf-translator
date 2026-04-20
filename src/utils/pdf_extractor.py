@@ -226,22 +226,15 @@ def extract_pdf(file_path, lang_arg):
                 "success": False, "error": "PDF produced no pages after rasterization"}
 
     # 3. Resolve OCR language
+    detected_script = None
     if lang_arg == "auto":
         try:
             lang = detect_script_lang(images[0], default="eng")
         except MissingLangPackError as e:
-            return {"text": digital_text, "isScanned": True,
-                    "pageCount": digital_pages or len(images),
-                    "success": False,
-                    "error": (
-                        f"Detected script '{e.script}' requires Tesseract language pack "
-                        f"'{e.lang}.traineddata', which is not installed. "
-                        f"Download it from https://github.com/tesseract-ocr/tessdata_best/raw/main/{e.lang}.traineddata "
-                        f"and place it in the Tesseract 'tessdata' folder "
-                        f"(usually C:\\Program Files\\Tesseract-OCR\\tessdata\\ on Windows). "
-                        f"Or pass lang='eng+{e.lang}' as a form field to try multi-language OCR."),
-                    "detectedScript": e.script,
-                    "requiredLang": e.lang}
+            detected_script = e.script
+            # For missing packs, warn but try with 'eng' as safe fallback
+            print(f"[pdf_extractor] WARNING: Detected script '{e.script}' requires pack '{e.lang}' which is missing. Falling back to 'eng'.", file=sys.stderr)
+            lang = "eng"
     else:
         lang = lang_arg
         miss = missing_langs(lang)
@@ -263,9 +256,16 @@ def extract_pdf(file_path, lang_arg):
                 "success": False,
                 "error": f"OCR with lang='{lang}' failed: {e}"}
 
-    return {"text": text, "isScanned": True,
-            "pageCount": digital_pages or len(images),
-            "success": True, "ocrLang": lang}
+    result = {
+        "text": text,
+        "isScanned": True,
+        "pageCount": digital_pages or len(images),
+        "success": True,
+        "ocrLang": lang,
+    }
+    if detected_script:
+        result["detectedScript"] = detected_script
+    return result
 
 
 def main():
