@@ -21,11 +21,12 @@ Multipart upload, field name `pdf`. Max file size 50 MB.
 Optional `lang` field (form or query) overrides OCR language. Defaults to `auto` (OSD detection). Accepts Tesseract codes like `hin`, `ara`, `chi_sim`, or combos like `eng+hin`.
 
 ```bash
-curl -F "pdf=@document.pdf" http://localhost:3000/api/translate
-curl -F "pdf=@document.pdf" -F "lang=hin" http://localhost:3000/api/translate
+curl -F "pdf=@document.pdf" https://pdf-translator-3p6o.onrender.com/api/translate
+curl -F "pdf=@document.pdf" -F "lang=hin" https://pdf-translator-3p6o.onrender.com/api/translate
 ```
 
 **Success response:**
+
 ```json
 {
   "success": true,
@@ -42,6 +43,7 @@ curl -F "pdf=@document.pdf" -F "lang=hin" http://localhost:3000/api/translate
 ```
 
 **Error codes:**
+
 - `400` — no file, empty file, invalid PDF signature, invalid `lang` value
 - `422` — PDF yielded no extractable text (image-only without supported lang pack, corrupt, or password-protected)
 - `429` — `code: "QUOTA_EXCEEDED"` when MyMemory daily quota is exhausted
@@ -80,45 +82,6 @@ Returns `{ success: true, ... }` for liveness checks.
    npm start     # production mode
    ```
 
-### Linux / macOS setup
-
-```bash
-# Debian/Ubuntu
-sudo apt install python3 python3-pip poppler-utils \
-    tesseract-ocr tesseract-ocr-osd tesseract-ocr-eng tesseract-ocr-hin
-
-# macOS
-brew install python poppler tesseract tesseract-lang
-
-pip3 install -r requirements.txt
-npm install
-npm start
-```
-
-### Environment variables
-
-| Var | Required | Purpose |
-|---|---|---|
-| `PORT` | no (default 3000) | HTTP port |
-| `MYMEMORY_EMAIL` | no | Raises MyMemory free quota from ~5K to ~50K chars/day |
-| `TESSERACT_PATH` | no | Path to `tesseract` binary — auto-detected from `PATH` otherwise |
-| `POPPLER_PATH` | Windows only | Path to Poppler's `bin/` directory |
-| `PYTHON_PATH` | no | Defaults to `python` (Win) or `python3` (Unix) |
-
-## Deploying to Render
-
-The repo includes a `Dockerfile`, `.dockerignore`, and `render.yaml` Blueprint.
-
-1. Push to GitHub.
-2. On [render.com](https://render.com): **New → Blueprint** → connect this repo. Render reads `render.yaml` and provisions a Docker web service.
-3. In the service's **Environment** tab, set `MYMEMORY_EMAIL` (not committed because `sync: false`).
-4. First build takes ~8–12 min (Tesseract language packs dominate). Subsequent deploys hit the layer cache and are much faster.
-
-**Render free-tier caveats:**
-- Container sleeps after 15 min idle → ~30s cold start.
-- 512 MB RAM limit. Large scanned PDFs (50+ pages) may OOM during image conversion; drop DPI in `pdf_extractor.py` (300 → 200) or upgrade to Starter ($7/mo, 2 GB) if it becomes a problem.
-- Image size ~1.3 GB with all 30 language packs. Trim the `tesseract-ocr-<lang>` lines in the `Dockerfile` for languages you don't need (each saves 5–20 MB).
-
 ## Project structure
 
 ```
@@ -136,11 +99,3 @@ Dockerfile                        Node 20 + Python 3 + poppler + 30 Tesseract la
 render.yaml                       Render Blueprint (Docker web service)
 requirements.txt                  Python deps
 ```
-
-## Troubleshooting
-
-- **`Unable to get page count. Is poppler installed and in PATH?`** — Poppler missing. On Windows set `POPPLER_PATH`. On Linux install `poppler-utils`.
-- **`UnicodeEncodeError: 'charmap' codec can't encode ...`** — Windows shell encoding issue; already handled (`PYTHONIOENCODING=utf-8` + `sys.stdout.reconfigure`). Reinstall deps if you still see it.
-- **`Missing Tesseract language pack for <script>`** — OSD detected e.g. Devanagari but no `hin.traineddata` is installed. Install it: Windows → re-run Tesseract installer and tick the language; Linux → `apt install tesseract-ocr-hin`.
-- **OCR returns gibberish Latin letters for non-Latin text** — the wrong language pack is being used. Check the `ocrLang` field in the response; if it says `eng` for Hindi text, OSD likely didn't detect the script (try passing `lang=hin` explicitly).
-- **`QUOTA_EXCEEDED` (429)** — MyMemory daily limit hit. Set `MYMEMORY_EMAIL` to raise it, or wait until the quota resets.
