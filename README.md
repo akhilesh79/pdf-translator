@@ -73,7 +73,7 @@ curl -F "pdf=@document.pdf" -F "lang=hin" https://pdf-translator-3p6o.onrender.c
 - `429` — `code: "QUOTA_EXCEEDED"` when MyMemory daily quota is exhausted
 - `500` — extraction or translation pipeline error
 
-### `GET /api/health`
+### `GET /health`
 
 Returns `{ success: true, ... }` for liveness checks.
 
