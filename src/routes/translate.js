@@ -5,17 +5,24 @@ const fs = require('fs');
 const fsp = require('fs').promises;
 const crypto = require('crypto');
 
-const { extractTextPython } = require('../utils/pdfExtractorPython');
-const { detectLanguage } = require('../utils/languageDetector');
-const { translateToEnglish, QuotaExceededError } = require('../utils/translator');
+const { forwardToPython } = require('../utils/pythonClient');
 const cache = require('../utils/translationCache');
 
 const router = express.Router();
 
 const UPLOAD_DIR = path.resolve('./uploads');
 const MAX_FILE_SIZE_MB = 50;
-const DEFAULT_OCR_LANG = 'auto';
-const LANG_RE = /^[a-z0-9_+]{2,40}$/;
+const DEFAULT_LANG = 'auto';
+const LANG_RE = /^[a-z0-9_+,]{2,60}$/;
+
+const ALLOWED_MIMES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/tiff',
+]);
+const ALLOWED_EXTS = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif']);
 
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -44,25 +51,20 @@ const upload = multer({
   storage,
   limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const okMime = file.mimetype === 'application/pdf';
-    const okExt = path.extname(file.originalname).toLowerCase() === '.pdf';
+    const okMime = ALLOWED_MIMES.has(file.mimetype);
+    const okExt = ALLOWED_EXTS.has(path.extname(file.originalname).toLowerCase());
     if (!okMime || !okExt) {
-      return cb(new Error('Only PDF files are accepted'));
+      return cb(new Error('Only PDF and image files (JPEG, PNG, TIFF) are accepted.'));
     }
     cb(null, true);
   },
 });
 
-async function isValidPdf(buffer) {
-  if (!buffer || buffer.length < 5) return false;
-  return buffer.slice(0, 5).toString('ascii') === '%PDF-';
-}
-
-router.post('/', upload.single('pdf'), async (req, res) => {
+router.post('/', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({
       success: false,
-      error: 'No PDF file uploaded. Use form field name "pdf".',
+      error: 'No file uploaded. Use form field name "file" (PDF, JPEG, PNG, or TIFF).',
     });
   }
 
@@ -70,91 +72,51 @@ router.post('/', upload.single('pdf'), async (req, res) => {
   const startTime = Date.now();
 
   try {
-    // 0. Read + sanity-check the file.
     const buffer = await fsp.readFile(filePath);
     if (buffer.length === 0) {
       return res.status(400).json({ success: false, error: 'Uploaded file is empty.' });
     }
-    if (!(await isValidPdf(buffer))) {
+
+    let langArg = (req.body && req.body.lang) || req.query.lang || DEFAULT_LANG;
+    langArg = String(langArg).toLowerCase().trim();
+    if (!LANG_RE.test(langArg)) {
       return res.status(400).json({
         success: false,
-        error: 'Uploaded file is not a valid PDF (missing %PDF- signature).',
+        error: `Invalid lang value. Use 'auto', a language code like 'hi', 'en', 'ar', or combos like 'hi+en'.`,
       });
     }
 
-    // 1. Resolve OCR language: client override (form/query) > default (auto).
-    let ocrLangArg = req.query.lang || DEFAULT_OCR_LANG;
-    ocrLangArg = String(ocrLangArg).toLowerCase().trim();
-    if (!LANG_RE.test(ocrLangArg)) {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid lang value. Use 'auto', a Tesseract code like 'hin', or a combo like 'eng+hin'.`,
-      });
-    }
-
-    // 2. Cache lookup by SHA-256 + lang (same PDF + different lang = different result).
-    const cacheKey = `${cache.hashBuffer(buffer)}:${ocrLangArg}`;
+    const cacheKey = `${cache.hashBuffer(buffer)}:${langArg}`;
     const cached = cache.get(cacheKey);
     if (cached) {
-      return res.json({
-        ...cached,
-        cached: true,
-        processingTimeMs: Date.now() - startTime,
-      });
+      return res.json({ ...cached, cached: true, processingTimeMs: Date.now() - startTime });
     }
 
-    // 3. Extract. Python handles script detection via OSD when lang='auto'.
-    const { text, isScanned, pageCount, ocrLang, detectedScript } = await extractTextPython(filePath, {
-      lang: ocrLangArg,
-    });
-
-    if (!text || text.trim().length === 0) {
-      return res.status(422).json({
-        success: false,
-        error:
-          'Could not extract any text. The PDF may be empty, image-only without OCR support, corrupt, or password-protected.',
-      });
-    }
-
-    // 4. Detect source language (with English heuristic fallback).
-    const sourceLanguage = detectLanguage(text);
-
-    // 5. Translate (short-circuits to passthrough when source == en).
-    const { translatedText, engine } = await translateToEnglish(text, sourceLanguage);
-
-    const payload = {
-      success: true,
-      sourceLanguage,
-      isScanned: isScanned || false,
-      ocrLang: ocrLang || null,
-      detectedScript: detectedScript || null,
-      pageCount: pageCount || null,
-      engine,
-      originalText: text,
-      translatedText,
-    };
+    const payload = await forwardToPython(filePath, { lang: langArg });
 
     cache.set(cacheKey, payload);
 
-    return res.json({
-      ...payload,
-      cached: false,
-      processingTimeMs: Date.now() - startTime,
-    });
+    return res.json({ ...payload, cached: false, processingTimeMs: Date.now() - startTime });
   } catch (err) {
     console.error('[translate] Failed:', err);
     if (res.headersSent) return undefined;
 
-    if (err instanceof QuotaExceededError) {
+    const status = err.response?.status;
+    const data = err.response?.data;
+
+    if (status === 429 || data?.code === 'QUOTA_EXCEEDED') {
       return res.status(429).json({
         success: false,
         code: 'QUOTA_EXCEEDED',
-        error: err.message,
+        error: data?.error || 'MyMemory daily translation quota exhausted.',
       });
+    }
+    if (status === 422) {
+      return res.status(422).json({ success: false, error: data?.detail || 'Could not extract text from file.' });
     }
     return res.status(500).json({
       success: false,
-      error: err.message || 'Internal error during PDF processing.',
+      error: err.message || 'Internal error during file processing.',
     });
   } finally {
     safeUnlink(filePath);

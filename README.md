@@ -1,125 +1,267 @@
 # PDF Translator
 
-Upload a PDF in any language, get back the English translation. Handles both digital PDFs (direct text extraction via `pdfplumber`) and scanned/image-based PDFs (OCR via Tesseract). Translates using the free MyMemory API.
+A REST API that extracts text from PDF and image files and translates it to English. Supports scanned documents, printed medical forms, and insurance claim scans (PMJAY, BOCW) with mixed Hindi/English/Gujarati content.
 
-## Features
+**No external API keys required** — OCR and translation run entirely offline using locally-loaded models.
 
-- **Any language in** — OCR via Tesseract covers 30+ scripts (Latin, Devanagari, Arabic, Han, Japanese, Korean, Cyrillic, Thai, Hebrew, etc.)
-- **Auto script detection** — Tesseract OSD (Orientation and Script Detection) reads page 1 and picks the right OCR language pack automatically; no manual language hint needed
-- **Digital + scanned PDFs** — `pdfplumber` for text-layer PDFs, falls back to OCR via `pdf2image` + `pytesseract` when the text layer is missing or unreliable
-- **SHA-256 caching** — identical uploads are served from an in-memory LRU cache (24h TTL, 100 items)
-- **Chunked translation with retries** — MyMemory's 500-char-per-request limit is handled by paragraph/sentence-aware chunking; network/5xx/429 errors retry with exponential backoff (1s→2s→4s→8s)
-- **Quota-aware** — explicit `429 QUOTA_EXCEEDED` response when MyMemory's daily limit is reached
-- **English passthrough** — English source text skips the translation API entirely
+---
 
-## Test PDFs
+## Architecture
 
-The `test-pdfs/` folder contains sample PDF files used for testing the translation pipeline. These PDFs cover a variety of languages and formats, including:
+```
+Client
+  │
+  ▼
+Node.js :3000  (Express)
+  ├── Multer       — file upload (PDF, JPEG, PNG, TIFF, max 50 MB)
+  ├── LRU cache    — SHA-256 key, 100 items, 24 h TTL
+  └── HTTP POST ──► Python :5000  (FastAPI)
+                        ├── pdfplumber  — digital PDF text extraction
+                        ├── EasyOCR     — scanned PDF / image OCR (hi + en)
+                        └── NLLB-200    — offline translation, 200 languages → English
+```
 
-- Digital PDFs (with selectable text)
-- Scanned/image-based PDFs (requiring OCR)
-- Multilingual documents (e.g., Hindi, Arabic, Chinese, Japanese, Russian, etc.)
-- Mixed-script and multi-page PDFs
+Node.js spawns the FastAPI service at startup and waits for `/health` before accepting requests.
 
-These test files help verify:
-
-- Accurate text extraction (digital and scanned)
-- Correct language/script detection
-- Robustness of translation and error handling
-
-You can add your own PDFs to this folder for custom testing. Example datasets may include:
-
-- Public domain books in different languages
-- Government forms or certificates
-- Academic papers
-- Synthetic PDFs generated for edge cases
-
-**Note:** Do not include copyrighted or sensitive documents in this folder if sharing the repository.
+---
 
 ## API
 
 ### `POST /api/translate`
 
-Multipart upload, field name `pdf`. Max file size 50 MB.
+Upload a PDF or image. Returns extracted text and its English translation.
 
-Optional `lang` field (form or query) overrides OCR language. Defaults to `auto` (OSD detection). Accepts Tesseract codes like `hin`, `ara`, `chi_sim`, or combos like `eng+hin`.
+**Body:** `multipart/form-data`
 
-```bash
-curl -F "pdf=@document.pdf" https://pdf-translator-3p6o.onrender.com/api/translate
-curl -F "pdf=@document.pdf" -F "lang=hin" https://pdf-translator-3p6o.onrender.com/api/translate
-```
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | File | Yes | PDF, JPEG, PNG, or TIFF |
+| `lang` | String | No | Source language hint (default: `auto`) |
 
-**Success response:**
+**`lang` values:** `hi` Hindi · `gu` Gujarati · `mr` Marathi · `pa` Punjabi · `bn` Bengali · `ta` Tamil · `te` Telugu · `kn` Kannada · `ml` Malayalam · `ar` Arabic · `fr` French · `de` German · `es` Spanish · `en` English (passthrough) · `auto` detect automatically
+
+**Response:**
 
 ```json
 {
   "success": true,
   "sourceLanguage": "hi",
-  "isScanned": true,
-  "ocrLang": "hin",
-  "pageCount": 3,
-  "engine": "mymemory",
-  "originalText": "...",
-  "translatedText": "...",
+  "isScanned": false,
+  "ocrLang": null,
+  "pageCount": 1,
+  "engine": "nllb-200",
+  "originalText": "भारत दक्षिण एशिया में स्थित एक विशाल देश है...",
+  "translatedText": "India is a vast country located in South Asia...",
   "cached": false,
-  "processingTimeMs": 4821
+  "processingTimeMs": 35000
 }
 ```
 
+| Field | Description |
+|-------|-------------|
+| `isScanned` | `true` = EasyOCR was used; `false` = digital text extracted directly |
+| `engine` | `nllb-200` translated · `passthrough` already English · `noop` empty |
+| `cached` | `true` = served from LRU cache (same file + lang uploaded before) |
+
 **Error codes:**
 
-- `400` — no file, empty file, invalid PDF signature, invalid `lang` value
-- `422` — PDF yielded no extractable text (image-only without supported lang pack, corrupt, or password-protected)
-- `429` — `code: "QUOTA_EXCEEDED"` when MyMemory daily quota is exhausted
-- `500` — extraction or translation pipeline error
+| Code | Reason |
+|------|--------|
+| `400` | No file, empty file, disallowed type, or invalid `lang` |
+| `422` | No text could be extracted (corrupt, password-protected, or blank scan) |
+| `500` | Unexpected pipeline error |
 
 ### `GET /health`
 
-Returns `{ success: true, ... }` for liveness checks.
+```json
+{
+  "success": true,
+  "message": "Server Health is Awesome!",
+  "python": { "success": true, "easyocr_ready": true, "nllb_ready": true }
+}
+```
 
-## Local development
+---
+
+## Local Development
 
 ### Prerequisites
 
-- **Node.js 20+**
-- **Python 3.8+** (must be on PATH, or set `PYTHON_PATH`)
-- **Tesseract OCR 5.x** with the `osd` language pack plus whichever scripts you need
-- **Poppler** (required by `pdf2image` for scanned PDFs)
+- Node.js 20+
+- Python 3.11+
+- Poppler (PDF → image for scanned PDFs)
 
-### Windows setup
+```bash
+# Windows
+winget install poppler
 
-1. Install Python from [python.org](https://www.python.org/downloads/) — tick "Add Python to PATH".
-2. Install Tesseract from [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki). Default path: `C:\Program Files\Tesseract-OCR`. During install, select the language packs you need **plus "osd"** (under Additional script data).
-3. Download Poppler for Windows ([release archive](https://github.com/oschwartz10612/poppler-windows/releases)), unzip to e.g. `C:\poppler`, and set `POPPLER_PATH=C:\poppler\Library\bin` in `.env`.
-4. Install Python packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-5. Install Node deps:
-   ```bash
-   npm install
-   ```
-6. Copy `.env.example` → `.env` and set `MYMEMORY_EMAIL` (optional but raises the free quota from 5K to 50K chars/day).
-7. Run:
-   ```bash
-   npm run dev   # auto-reload
-   npm start     # production mode
-   ```
+# macOS
+brew install poppler
 
-## Project structure
+# Ubuntu / Debian
+sudo apt install poppler-utils
+```
+
+### Setup
+
+```bash
+# Python deps
+pip install -r requirements.txt
+
+# Node deps
+npm install
+
+# Start — Node auto-spawns the FastAPI service
+npm run dev
+```
+
+**First run:** EasyOCR (~200 MB) and NLLB-200 (~1.2 GB) download automatically into `.hf_cache/`. Allow 3–5 minutes on a good connection.
+
+### Test with curl / Postman
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# PDF (auto-detect language)
+curl -X POST http://localhost:3000/api/translate \
+  -F "file=@document.pdf"
+
+# Image with language hint
+curl -X POST http://localhost:3000/api/translate \
+  -F "file=@scan.jpg" \
+  -F "lang=hi"
+
+# Hit FastAPI directly (bypasses Node LRU cache)
+curl -X POST http://localhost:5000/process \
+  -F "file=@document.pdf" \
+  -F "lang=auto"
+```
+
+**Postman:** Body → form-data → key `file` (type: File) → select file. Optionally add key `lang` (type: Text).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | Node.js listen port |
+| `PYTHON_PATH` | `python3` / `python` | Python interpreter |
+| `PYTHON_SERVICE_URL` | `http://127.0.0.1:5000` | FastAPI base URL |
+| `HF_HOME` | `.hf_cache/` in project root | HuggingFace model cache |
+
+---
+
+## Docker
+
+### Build
+
+```bash
+docker build -t pdf-translator .
+```
+
+Three-stage build:
+
+| Stage | Base | What it does |
+|-------|------|--------------|
+| `py-deps` | `python:3.11-slim-bookworm` | Installs Python packages into `/opt/venv`; pre-bakes EasyOCR weights |
+| `node-deps` | `node:20-slim` | Installs Node production dependencies |
+| `runtime` | `python:3.11-slim-bookworm` | Copies venv + node_modules + source; adds Node.js via NodeSource |
+
+Each stage is an independent cache layer — changing `package.json` only invalidates the Node stage.
+
+### Run
+
+```bash
+# Mount .hf_cache so NLLB-200 persists across container restarts
+docker run -p 3000:3000 \
+  -v "$(pwd)/.hf_cache:/app/.hf_cache" \
+  pdf-translator
+```
+
+First start downloads NLLB-200 to the mounted volume (~2 min). All subsequent starts load it instantly from disk.
+
+---
+
+## Render Deployment
+
+### 1. Create a Web Service
+
+| Setting | Value |
+|---------|-------|
+| Runtime | **Docker** |
+| Branch | `main` |
+| Dockerfile path | `./Dockerfile` |
+
+### 2. Plan
+
+**Standard ($25/mo, 2 GB RAM)** minimum — NLLB-200 requires ~1.5 GB at runtime. The free tier (512 MB) will OOM.
+
+### 3. Persistent Disk
+
+Prevents NLLB-200 from re-downloading on every redeploy:
+
+| Setting | Value |
+|---------|-------|
+| Name | `hf-cache` |
+| Mount Path | `/app/.hf_cache` |
+| Size | 5 GB |
+
+### 4. Environment Variables
+
+| Key | Value |
+|-----|-------|
+| `PYTHON_PATH` | `/opt/venv/bin/python3` |
+
+`PORT` is injected automatically by Render.
+
+### 5. Health Check
+
+In **Settings → Health & Alerts** set the path to `/health`.
+
+### Cold Start Timeline
+
+| Event | Duration |
+|-------|----------|
+| Image pull + container start | ~30 s |
+| EasyOCR load (pre-baked in image) | ~10 s |
+| NLLB-200 load from persistent disk | ~20 s |
+| **Ready to serve** | **~60 s total** |
+
+First-ever deploy only: NLLB-200 downloads from HuggingFace Hub to the persistent disk (~2–3 min extra).
+
+---
+
+## Project Structure
 
 ```
 src/
-├── server.js                     Express app, startup Python-deps check
+├── server.js              Express app — spawns FastAPI, waits for /health
 ├── routes/
-│   └── translate.js              Upload handler, validation, cache, orchestration
-└── utils/
-    ├── pdf_extractor.py          pdfplumber + OSD + Tesseract OCR
-    ├── pdfExtractorPython.js     python-shell wrapper (captures stderr)
-    ├── languageDetector.js       franc + English heuristic + ISO → Tesseract map
-    ├── translator.js             MyMemory client (chunking, retries, quota handling)
-    └── translationCache.js       LRU keyed by sha256(pdf) + ocrLang
-Dockerfile                        Node 20 + Python 3 + poppler + 30 Tesseract langs
-render.yaml                       Render Blueprint (Docker web service)
-requirements.txt                  Python deps
+│   └── translate.js       Upload handler, validation, LRU cache, pythonClient call
+├── utils/
+│   ├── pythonClient.js    HTTP client: POST multipart to FastAPI :5000
+│   └── translationCache.js  LRU cache keyed by sha256(file) + lang
+└── python/
+    ├── main.py            FastAPI app — loads EasyOCR + NLLB at startup
+    ├── extractor.py       pdfplumber → EasyOCR fallback; image OCR
+    ├── translator.py      NLLB-200 with int8 quantization + batched inference
+    ├── detector.py        langdetect language detection
+    └── models.py          Pydantic response schema
+
+Dockerfile                 3-stage build (py-deps / node-deps / runtime)
+requirements.txt           Python deps
+package.json               Node deps
 ```
+
+---
+
+## Model Details
+
+| Model | Size | Used for |
+|-------|------|----------|
+| EasyOCR (hi, en) | ~200 MB | OCR on scanned PDFs and images |
+| NLLB-200-distilled-600M | ~1.2 GB | Offline translation, 200 languages → English |
+
+**Translation speed (CPU):** ~15–40 s per page. int8 dynamic quantization and batched inference reduce latency 2–3× versus the baseline.
+
+**OCR accuracy:** 70–90% on typed/printed scans · 20–50% on handwritten text.

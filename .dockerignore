@@ -18,3 +18,12 @@ test
 tests
 *.md
 !README.md
+# Python bytecode — never needed in image
+__pycache__
+*.pyc
+*.pyo
+# Model caches — baked in image (EasyOCR) or mounted as volume (NLLB)
+.hf_cache
+# Dataset files — not part of the app
+841403b5-bb4b-4e2a-a73f-570c1b1af8fb
+c110a5f8-6e79-43bd-bd7a-979677354958

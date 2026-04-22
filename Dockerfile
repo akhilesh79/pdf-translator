@@ -1,67 +1,76 @@
-# ---------------------------------------------------------------
-# PDF Translator — runs Node (Express) + Python (pdfplumber/OCR)
-# inside one container so deploys are reproducible on Render.
-# ---------------------------------------------------------------
-FROM node:20-bookworm-slim
+# ── Stage 1: Python deps + EasyOCR model pre-bake ────────────────────
+# Isolated from the runtime so build tools (gcc, etc.) don't bloat the
+# final image. EasyOCR (~200 MB) is baked here so containers start cold.
+FROM python:3.11-slim-bookworm AS py-deps
 
-# System deps: Python, Poppler (for pdf2image), Tesseract + language packs.
-# Each tesseract-ocr-<lang> adds ~5-20 MB. Trim this list if you want a smaller image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 \
-      python3-pip \
-      poppler-utils \
-      tesseract-ocr \
-      tesseract-ocr-osd \
-      tesseract-ocr-eng \
-      tesseract-ocr-hin \
-      tesseract-ocr-ara \
-      tesseract-ocr-chi-sim \
-      tesseract-ocr-chi-tra \
-      tesseract-ocr-jpn \
-      tesseract-ocr-kor \
-      tesseract-ocr-rus \
-      tesseract-ocr-fra \
-      tesseract-ocr-deu \
-      tesseract-ocr-spa \
-      tesseract-ocr-por \
-      tesseract-ocr-ita \
-      tesseract-ocr-nld \
-      tesseract-ocr-pol \
-      tesseract-ocr-tur \
-      tesseract-ocr-vie \
-      tesseract-ocr-tha \
-      tesseract-ocr-ell \
-      tesseract-ocr-heb \
-      tesseract-ocr-fas \
-      tesseract-ocr-urd \
-      tesseract-ocr-ben \
-      tesseract-ocr-tam \
-      tesseract-ocr-tel \
-      tesseract-ocr-guj \
-      tesseract-ocr-pan \
-      tesseract-ocr-mar \
-      tesseract-ocr-mal \
-      tesseract-ocr-kan \
-      tesseract-ocr-ukr \
-  && rm -rf /var/lib/apt/lists/*
+      build-essential \
+      libgl1-mesa-glx \
+      libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Where tessdata lives on Debian bookworm with Tesseract 5.x.
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+# Isolated venv — copied verbatim into the runtime stage.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-bake EasyOCR model weights so the container doesn't download them
+# on every cold start. Models are written to /root/.EasyOCR (~200 MB).
+RUN python3 -c "import easyocr; easyocr.Reader(['hi', 'en'], gpu=False, verbose=False)"
+
+
+# ── Stage 2: Node prod deps ───────────────────────────────────────────
+FROM node:20-slim AS node-deps
 
 WORKDIR /app
-
-# 1. Python deps (cached layer — changes rarely).
-COPY requirements.txt ./
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
-
-# 2. Node deps (cached layer).
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# 3. App source.
+
+# ── Stage 3: Runtime image ────────────────────────────────────────────
+# python:3.11-slim-bookworm base keeps the venv paths identical to Stage 1.
+# Node.js is added via NodeSource so both runtimes live in one image.
+FROM python:3.11-slim-bookworm
+
+# Runtime system libs + Node.js 20
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      poppler-utils \
+      libgl1-mesa-glx \
+      libglib2.0-0 \
+      libsm6 \
+      libxext6 \
+      libxrender-dev \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python venv (all packages + uvicorn binary) from Stage 1
+COPY --from=py-deps /opt/venv /opt/venv
+
+# Pre-baked EasyOCR model weights from Stage 1
+COPY --from=py-deps /root/.EasyOCR /root/.EasyOCR
+
+# Production Node modules from Stage 2
+COPY --from=node-deps /app/node_modules ./node_modules
+
+# Application source (respects .dockerignore)
 COPY . .
 
-# Render injects PORT at runtime; server.js already reads process.env.PORT.
+# /opt/venv/bin on PATH → `python3 -m uvicorn` resolves to the venv.
+# HF_HOME → Render persistent disk (mount at /app/.hf_cache) so NLLB-200
+# survives redeploys without re-downloading 1.2 GB each time.
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHON_PATH="/opt/venv/bin/python3" \
+    HF_HOME="/app/.hf_cache" \
+    HF_HUB_DISABLE_SYMLINKS_WARNING="1"
+
 EXPOSE 3000
 
+# Node spawns uvicorn (FastAPI) as a child process, waits for /health,
+# then begins accepting Express requests.
 CMD ["node", "src/server.js"]
