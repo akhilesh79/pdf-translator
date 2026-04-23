@@ -4,7 +4,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 
 const PYTHON_SERVICE_URL = process.env.PYTHON_SERVICE_URL || 'http://127.0.0.1:5000';
-const REQUEST_TIMEOUT_MS = 180_000;
+const REQUEST_TIMEOUT_MS = 300_000;
 
 const MIME_MAP = {
   '.pdf':  'application/pdf',

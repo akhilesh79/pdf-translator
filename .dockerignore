@@ -1,29 +1,48 @@
-node_modules
-npm-debug.log
+# Git
 .git
 .gitignore
+
+# Local Python venv — Docker builds its own in the image
+.venv/
+
+# Environment / secrets — injected at runtime, not baked in
 .env
 .env.*
 !.env.example
+
+# Node dev artifacts
+node_modules
+npm-debug.log
+coverage
+.nyc_output
+
+# Uploads — temp files, not app source
 uploads/*
 !uploads/.gitkeep
-*.log
+
+# Model caches — NLLB-200 is mounted as a volume at runtime
+.hf_cache/
+
+# Python bytecode
+__pycache__
+*.pyc
+*.pyo
+
+# Docs and IDE
+*.md
+!README.md
 .vscode
 .idea
 .DS_Store
 Thumbs.db
-coverage
-.nyc_output
+
+# Test files
 test
 tests
-*.md
-!README.md
-# Python bytecode — never needed in image
-__pycache__
-*.pyc
-*.pyo
-# Model caches — baked in image (EasyOCR) or mounted as volume (NLLB)
-.hf_cache
-# Dataset files — not part of the app
+
+# Dataset folders
 841403b5-bb4b-4e2a-a73f-570c1b1af8fb
 c110a5f8-6e79-43bd-bd7a-979677354958
+
+.venv/
+

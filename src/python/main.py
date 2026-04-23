@@ -1,9 +1,9 @@
 import sys
+import torch
+import torch.nn as nn
 from contextlib import asynccontextmanager
 
-import easyocr
 from fastapi import FastAPI, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 
 from .extractor import process_file
 from .models import ProcessResponse
@@ -14,10 +14,36 @@ models: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. EasyOCR — text extraction from scanned images
-    print("[python] Loading EasyOCR (hi, en)...", file=sys.stderr)
-    models["ocr"] = easyocr.Reader(["hi", "en"], gpu=False, verbose=False)
-    print("[python] EasyOCR ready.", file=sys.stderr)
+    # 1. Surya OCR — detection + recognition (auto-multilingual, 90+ languages)
+    print("[python] Loading Surya OCR models...", file=sys.stderr)
+    from .surya_compat import apply as _patch_surya; _patch_surya()
+
+    from surya.detection import DetectionPredictor
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+
+    foundation = FoundationPredictor()
+    det_predictor = DetectionPredictor()
+    rec_predictor = RecognitionPredictor(foundation_predictor=foundation)
+
+    if torch.cuda.is_available():
+        # Surya auto-selects fp16 on CUDA via its device/dtype detection
+        print(f"[python] Surya running on GPU: {torch.cuda.get_device_name(0)}", file=sys.stderr)
+    else:
+        # CPU fallback: int8 quantization gives 2-3x speedup
+        try:
+            foundation.model = torch.quantization.quantize_dynamic(
+                foundation.model, {nn.Linear}, dtype=torch.qint8
+            )
+            det_predictor.model = torch.quantization.quantize_dynamic(
+                det_predictor.model, {nn.Linear}, dtype=torch.qint8
+            )
+            print("[python] Surya models quantized (int8 CPU).", file=sys.stderr)
+        except Exception as e:
+            print(f"[python] Surya quantization skipped: {e}", file=sys.stderr)
+
+    models["surya"] = {"det_predictor": det_predictor, "rec_predictor": rec_predictor}
+    print("[python] Surya OCR ready.", file=sys.stderr)
 
     # 2. NLLB-200 — local offline translation (no external API)
     models["nllb"] = load_nllb_model()
@@ -33,7 +59,7 @@ app = FastAPI(title="PDF Translator Python Service", lifespan=lifespan)
 def health():
     return {
         "success": True,
-        "easyocr_ready": "ocr" in models,
+        "surya_ready": "surya" in models,
         "nllb_ready": "nllb" in models,
     }
 
@@ -55,7 +81,7 @@ async def process(
         filename=file.filename,
         content_type=file.content_type or "",
         lang_arg=lang,
-        reader=models.get("ocr"),
+        surya_models=models.get("surya"),
         nllb_model=models.get("nllb"),
     )
 

@@ -67,7 +67,7 @@ async function waitForPythonReady(maxMs = 120_000) {
   console.log('[server] Starting Python FastAPI service...');
   startPythonService();
 
-  console.log('[server] Waiting for EasyOCR to load (may take ~30s on first run)...');
+  console.log('[server] Waiting for Surya OCR + NLLB-200 to load (may take ~60s on first run)...');
   await waitForPythonReady();
   console.log('[server] Python service ready.');
 

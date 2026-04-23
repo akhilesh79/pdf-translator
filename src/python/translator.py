@@ -85,38 +85,32 @@ def _chunk_by_paragraph(text: str) -> list[str]:
 
 
 def load_nllb_model() -> dict:
-    """
-    Download (first run) and load NLLB-200 distilled 600M with int8 quantization.
-    Dynamic quantization converts Linear layers to int8 — 2-3x faster on CPU,
-    no GPU needed, minimal quality loss.
-    """
     import torch
-    import torch.quantization
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    # Use all available CPU cores for matrix ops
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_num_threads(multiprocessing.cpu_count())
 
     model_name = "facebook/nllb-200-distilled-600M"
-    print(f"[translator] Loading {model_name} (downloading on first run ~1.2 GB)...", file=sys.stderr)
+    print(f"[translator] Loading {model_name} on {device.upper()}...", file=sys.stderr)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    if device == "cuda":
+        # fp16 on GPU: ~600 MB VRAM, 10-20x faster than CPU int8
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        model = model.to(device)
+    else:
+        # int8 on CPU: 2-3x faster than fp32, no GPU needed
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+
     model.eval()
-
-    # Dynamic int8 quantization: replaces nn.Linear weights with int8 at inference time.
-    # No calibration data needed; applied once here so every request benefits.
-    print("[translator] Applying int8 quantization for faster CPU inference...", file=sys.stderr)
-    model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
-
-    print(f"[translator] NLLB-200 ready (threads={torch.get_num_threads()}).", file=sys.stderr)
-    return {"model": model, "tokenizer": tokenizer}
+    print(f"[translator] NLLB-200 ready ({device.upper()}).", file=sys.stderr)
+    return {"model": model, "tokenizer": tokenizer, "device": device}
 
 
-def _translate_batch(chunks: list[str], model, tokenizer, target_token_id: int) -> list[str]:
-    """Translate a batch of chunks in a single model.generate() call."""
+def _translate_batch(chunks: list[str], model, tokenizer, target_token_id: int, device: str = "cpu") -> list[str]:
     import torch
 
     inputs = tokenizer(
@@ -126,6 +120,9 @@ def _translate_batch(chunks: list[str], model, tokenizer, target_token_id: int) 
         max_length=512,
         padding=True,
     )
+    if device != "cpu":
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -138,11 +135,6 @@ def _translate_batch(chunks: list[str], model, tokenizer, target_token_id: int) 
 
 
 def translate_to_english(text: str, source_lang: str, nllb_bundle: dict) -> tuple[str, str]:
-    """
-    Translate `text` to English using the locally-loaded NLLB-200 model.
-    No external API — runs entirely offline after the first model download.
-    Chunks are batched together so the model runs once per batch, not once per chunk.
-    """
     if not text or not text.strip():
         return "", "noop"
 
@@ -153,6 +145,7 @@ def translate_to_english(text: str, source_lang: str, nllb_bundle: dict) -> tupl
 
     model = nllb_bundle["model"]
     tokenizer = nllb_bundle["tokenizer"]
+    device = nllb_bundle.get("device", "cpu")
     target_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
 
     tokenizer.src_lang = src_nllb
@@ -166,13 +159,13 @@ def translate_to_english(text: str, source_lang: str, nllb_bundle: dict) -> tupl
     for i in range(0, len(chunks), MAX_BATCH_SIZE):
         batch = chunks[i: i + MAX_BATCH_SIZE]
         try:
-            results = _translate_batch(batch, model, tokenizer, target_token_id)
+            results = _translate_batch(batch, model, tokenizer, target_token_id, device)
             translated_parts.extend(results)
         except Exception as e:
             print(f"[translator] batch {i} failed ({e}), falling back to per-chunk", file=sys.stderr)
             for chunk in batch:
                 try:
-                    results = _translate_batch([chunk], model, tokenizer, target_token_id)
+                    results = _translate_batch([chunk], model, tokenizer, target_token_id, device)
                     translated_parts.append(results[0])
                 except Exception as e2:
                     print(f"[translator] chunk failed ({e2}), keeping original", file=sys.stderr)

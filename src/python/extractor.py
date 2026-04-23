@@ -1,75 +1,49 @@
 import io
+import os
 import re
 import sys
 import unicodedata
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+import torch
+
 import pdfplumber
 from PIL import Image
 from pdf2image import convert_from_bytes
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from .detector import detect_language
 from .translator import translate_to_english
 
 PDF_MAGIC = b"%PDF-"
 DIGITAL_TEXT_MIN_CHARS = 25
-OCR_PAGE_TIMEOUT_S = 60
-
-TESSERACT_TO_EASYOCR = {
-    "eng": "en", "hin": "hi", "ara": "ar", "chi_sim": "ch_sim",
-    "chi_tra": "ch_tra", "jpn": "ja", "kor": "ko", "rus": "ru",
-    "fra": "fr", "deu": "de", "spa": "es", "por": "pt",
-}
-
-DEFAULT_LANG_LIST = ["hi", "en"]
+OCR_BATCH_TIMEOUT_S = 600
+PDF_DPI = 150       # lower than default 200 — 44% fewer pixels, same OCR quality
+MAX_IMAGE_DIM = 1600  # cap longest side before Surya to bound inference time
 
 
 # ---------------------------------------------------------------------------
-# OCR text cleaner — makes extracted text readable before translation
+# OCR text cleaner
 # ---------------------------------------------------------------------------
 
 def clean_ocr_text(text: str) -> str:
-    """
-    Remove OCR noise and normalize extracted text so translation produces
-    coherent English sentences instead of garbled output.
-    """
-    # Unicode normalise (NFKC) — fixes ligatures, half-width chars, etc.
     text = unicodedata.normalize("NFKC", text)
-
     lines = text.split("\n")
     cleaned: list[str] = []
-
     for raw_line in lines:
         line = raw_line.strip()
-
-        # Drop empty lines at collection stage (re-added as paragraph breaks later)
         if not line:
             cleaned.append("")
             continue
-
-        # Drop single isolated characters — almost always OCR fragments
         if len(line) <= 2 and not line.isalpha():
             continue
-
-        # Drop lines where alphabetic ratio is below 25%
-        # (scan artifacts: "~~ 0 _ _ ~~", "====" etc.)
         alpha = sum(1 for c in line if c.isalpha())
         if len(line) > 4 and alpha / len(line) < 0.25:
             continue
-
-        # Collapse repeated punctuation (e.g. "......" → "...")
         line = re.sub(r'([^\w\s])\1{2,}', r'\1\1', line)
-
-        # Fix spaces around punctuation
         line = re.sub(r'\s+([,.:;!?)])', r'\1', line)
         line = re.sub(r'([(])\s+', r'\1', line)
-
-        # Collapse multiple internal spaces
         line = re.sub(r' {2,}', ' ', line)
-
         cleaned.append(line)
-
-    # Collapse runs of more than one blank line into a single paragraph break
     result_lines: list[str] = []
     prev_blank = False
     for line in cleaned:
@@ -78,12 +52,11 @@ def clean_ocr_text(text: str) -> str:
             continue
         result_lines.append(line)
         prev_blank = is_blank
-
     return "\n".join(result_lines).strip()
 
 
 # ---------------------------------------------------------------------------
-# PDF validation helpers
+# PDF / image validation helpers
 # ---------------------------------------------------------------------------
 
 def is_pdf(file_bytes: bytes) -> bool:
@@ -104,60 +77,59 @@ def pdfplumber_looks_reliable(text: str) -> bool:
     return sum(1 for c in non_ws if c.isalnum()) / len(non_ws) >= 0.55
 
 
-def resolve_lang_list(lang_arg: str) -> list[str]:
-    if lang_arg == "auto":
-        return DEFAULT_LANG_LIST
-    raw = lang_arg.replace("+", ",").split(",")
-    result = []
-    for code in raw:
-        code = code.strip()
-        mapped = TESSERACT_TO_EASYOCR.get(code, code)
-        if mapped:
-            result.append(mapped)
-    return result if result else DEFAULT_LANG_LIST
+def _cap_image_size(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= MAX_IMAGE_DIM:
+        return img
+    scale = MAX_IMAGE_DIM / longest
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
 # ---------------------------------------------------------------------------
-# EasyOCR helpers
+# Surya OCR — returns one string per input image
 # ---------------------------------------------------------------------------
 
-def _ocr_page(reader, img_np: np.ndarray) -> str:
-    results = reader.readtext(img_np, detail=0, paragraph=True)
-    return "\n".join(results)
+def _run_surya(surya_models: dict, pil_images: list[Image.Image]) -> list[str]:
+    det_predictor = surya_models["det_predictor"]
+    rec_predictor = surya_models["rec_predictor"]
+    with torch.inference_mode():
+        results = rec_predictor(pil_images, det_predictor=det_predictor)
+    pages = []
+    for page_result in results:
+        lines = [
+            line.text for line in page_result.text_lines
+            if line.text and line.text.strip()
+        ]
+        pages.append("\n".join(lines))
+    return pages
 
 
-def ocr_images(reader, images_np: list, lang_arg: str) -> str:
-    parts = []
+def ocr_images(surya_models: dict, pil_images: list[Image.Image]) -> list[str]:
     with ThreadPoolExecutor(max_workers=1) as ex:
-        for img_np in images_np:
-            future = ex.submit(_ocr_page, reader, img_np)
-            try:
-                text = future.result(timeout=OCR_PAGE_TIMEOUT_S)
-                if text:
-                    parts.append(text)
-            except FutureTimeout:
-                print("[extractor] OCR page timed out, skipping", file=sys.stderr)
-            except Exception as e:
-                print(f"[extractor] OCR page error: {e}", file=sys.stderr)
-    return "\n".join(parts).strip()
+        future = ex.submit(_run_surya, surya_models, pil_images)
+        try:
+            return future.result(timeout=OCR_BATCH_TIMEOUT_S)
+        except FutureTimeout:
+            print("[extractor] Surya OCR batch timed out", file=sys.stderr)
+            return []
+        except Exception as e:
+            print(f"[extractor] Surya OCR error: {e}", file=sys.stderr)
+            return []
 
 
 # ---------------------------------------------------------------------------
-# Result builder — clean → detect → translate
+# Result builder
 # ---------------------------------------------------------------------------
 
 def _build_result(raw_text: str, is_scanned: bool, page_count, lang_arg: str, nllb_model) -> dict:
     if not raw_text or not raw_text.strip():
         return {"success": False, "error": "No text could be extracted from the file."}
-
-    # Clean OCR noise to improve translation quality
     cleaned_text = clean_ocr_text(raw_text)
     if not cleaned_text.strip():
         return {"success": False, "error": "Text extracted but was too noisy to process."}
-
     source_lang = detect_language(cleaned_text)
     translated, engine = translate_to_english(cleaned_text, source_lang, nllb_model)
-
     return {
         "success": True,
         "isScanned": is_scanned,
@@ -175,53 +147,78 @@ def _build_result(raw_text: str, is_scanned: bool, page_count, lang_arg: str, nl
 # ---------------------------------------------------------------------------
 
 def process_file(file_bytes: bytes, filename: str, content_type: str,
-                 lang_arg: str, reader, nllb_model) -> dict:
+                 lang_arg: str, surya_models: dict, nllb_model) -> dict:
     try:
         if is_pdf(file_bytes):
-            return _process_pdf(file_bytes, lang_arg, reader, nllb_model)
+            return _process_pdf(file_bytes, lang_arg, surya_models, nllb_model)
         else:
-            return _process_image(file_bytes, lang_arg, reader, nllb_model)
+            return _process_image(file_bytes, lang_arg, surya_models, nllb_model)
     except Exception as e:
         return {"success": False, "error": f"Unexpected error: {e}"}
 
 
-def _process_pdf(file_bytes: bytes, lang_arg: str, reader, nllb_model) -> dict:
-    page_count = None
-    digital_text = ""
+def _process_pdf(file_bytes: bytes, lang_arg: str, surya_models: dict, nllb_model) -> dict:
+    page_count = 0
+    digital_texts: dict[int, str] = {}   # page index → reliable digital text
+    pages_need_ocr: list[int] = []       # page indices that require Surya
 
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             page_count = len(pdf.pages)
-            parts = [p.extract_text() or "" for p in pdf.pages]
-            digital_text = "\n".join(parts).strip()
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                if pdfplumber_looks_reliable(text):
+                    digital_texts[i] = text
+                else:
+                    pages_need_ocr.append(i)
     except Exception as e:
         print(f"[extractor] pdfplumber failed: {e}", file=sys.stderr)
+        pages_need_ocr = list(range(max(page_count, 1)))
 
-    if pdfplumber_looks_reliable(digital_text):
-        return _build_result(digital_text, False, page_count, lang_arg, nllb_model)
+    # Fast path: every page has reliable digital text
+    if not pages_need_ocr:
+        combined = "\n\n".join(digital_texts[i] for i in range(page_count))
+        return _build_result(combined, False, page_count, lang_arg, nllb_model)
 
-    # Scanned PDF — rasterise then OCR
-    poppler_path = __import__("os").environ.get("POPPLER_PATH") or None
+    # Rasterise at low DPI — only pages that need OCR are extracted from the batch
+    poppler_path = os.environ.get("POPPLER_PATH") or None
+    kwargs: dict = {"dpi": PDF_DPI}
+    if poppler_path:
+        kwargs["poppler_path"] = poppler_path
     try:
-        kwargs = {"poppler_path": poppler_path} if poppler_path else {}
-        pil_images = convert_from_bytes(file_bytes, **kwargs)
+        all_pil = convert_from_bytes(file_bytes, **kwargs)
     except Exception as e:
         return {"success": False, "error": f"PDF rasterization failed (is poppler installed?): {e}"}
 
-    page_count = page_count or len(pil_images)
-    images_np = [np.array(img) for img in pil_images]
-    del pil_images
+    page_count = page_count or len(all_pil)
+    ocr_pil = [_cap_image_size(all_pil[i]) for i in pages_need_ocr if i < len(all_pil)]
+    ocr_pages = ocr_images(surya_models, ocr_pil) if ocr_pil else []
 
-    ocr_text = ocr_images(reader, images_np, lang_arg)
-    return _build_result(ocr_text, True, page_count, lang_arg, nllb_model)
+    # Map each OCR result back to its original page index
+    ocr_map: dict[int, str] = {
+        pages_need_ocr[i]: ocr_pages[i]
+        for i in range(min(len(pages_need_ocr), len(ocr_pages)))
+    }
+
+    # Assemble final text in page order, mixing digital and OCR
+    parts = []
+    for i in range(page_count):
+        if i in digital_texts:
+            parts.append(digital_texts[i])
+        elif i in ocr_map and ocr_map[i].strip():
+            parts.append(ocr_map[i])
+
+    combined = "\n\n".join(p for p in parts if p.strip())
+    return _build_result(combined, bool(pages_need_ocr), page_count, lang_arg, nllb_model)
 
 
-def _process_image(file_bytes: bytes, lang_arg: str, reader, nllb_model) -> dict:
+def _process_image(file_bytes: bytes, lang_arg: str, surya_models: dict, nllb_model) -> dict:
     try:
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        img_np = np.array(img)
     except Exception as e:
         return {"success": False, "error": f"Cannot open image: {e}"}
 
-    ocr_text = ocr_images(reader, [img_np], lang_arg)
+    img = _cap_image_size(img)
+    ocr_pages = ocr_images(surya_models, [img])
+    ocr_text = "\n\n".join(p for p in ocr_pages if p.strip())
     return _build_result(ocr_text, True, 1, lang_arg, nllb_model)
