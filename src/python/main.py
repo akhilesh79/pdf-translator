@@ -1,6 +1,4 @@
 import sys
-import torch
-import torch.nn as nn
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile
@@ -25,22 +23,6 @@ async def lifespan(app: FastAPI):
     foundation = FoundationPredictor()
     det_predictor = DetectionPredictor()
     rec_predictor = RecognitionPredictor(foundation_predictor=foundation)
-
-    if torch.cuda.is_available():
-        # Surya auto-selects fp16 on CUDA via its device/dtype detection
-        print(f"[python] Surya running on GPU: {torch.cuda.get_device_name(0)}", file=sys.stderr)
-    else:
-        # CPU fallback: int8 quantization gives 2-3x speedup
-        try:
-            foundation.model = torch.quantization.quantize_dynamic(
-                foundation.model, {nn.Linear}, dtype=torch.qint8
-            )
-            det_predictor.model = torch.quantization.quantize_dynamic(
-                det_predictor.model, {nn.Linear}, dtype=torch.qint8
-            )
-            print("[python] Surya models quantized (int8 CPU).", file=sys.stderr)
-        except Exception as e:
-            print(f"[python] Surya quantization skipped: {e}", file=sys.stderr)
 
     models["surya"] = {"det_predictor": det_predictor, "rec_predictor": rec_predictor}
     print("[python] Surya OCR ready.", file=sys.stderr)

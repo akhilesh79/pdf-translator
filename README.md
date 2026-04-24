@@ -18,7 +18,7 @@ Node.js :3000  (Express)
   └── HTTP POST ──► Python :5000  (FastAPI)
                         ├── pdfplumber  — digital PDF text extraction
                         ├── Surya OCR   — scanned PDF / image OCR (90+ languages, auto-detect)
-                        └── NLLB-200    — offline translation, 200 languages → English
+                        └── opus-mt-mul-en — offline translation, 50+ languages → English
 ```
 
 Node.js spawns the FastAPI service at startup and waits for `/health` before accepting requests.
@@ -60,7 +60,7 @@ Upload a PDF or image. Returns extracted text and its English translation.
 | Field | Description |
 |-------|-------------|
 | `isScanned` | `true` = Surya OCR was used; `false` = digital text extracted directly |
-| `engine` | `nllb-200` translated · `passthrough` already English · `noop` empty |
+| `engine` | `opus-mt` translated · `passthrough` already English · `noop` empty |
 | `cached` | `true` = served from LRU cache (same file + lang uploaded before) |
 
 **Error codes:**
@@ -88,7 +88,7 @@ Upload a PDF or image. Returns extracted text and its English translation.
 ### Prerequisites
 
 - Node.js 20+
-- Python 3.11+ (3.14 supported with compatibility shim)
+- Python 3.10–3.12 (PyTorch wheels not available for 3.13+)
 - Poppler (PDF → image for scanned PDFs)
 
 ```bash
@@ -115,7 +115,7 @@ npm install
 npm run dev
 ```
 
-**First run:** Surya OCR models (~1.5 GB total) and NLLB-200 (~1.2 GB) download automatically into their respective caches. Allow 5–10 minutes on a good connection.
+**First run:** Surya OCR models (~1.5 GB) and opus-mt-mul-en (~300 MB) download automatically (~1.8 GB total). Allow 5–10 minutes. Every subsequent start loads from disk in ~1 minute.
 
 ### Test with curl / Postman
 
@@ -258,7 +258,7 @@ package.json               Node deps
 | Model | Size | Used for |
 |-------|------|----------|
 | Surya OCR (detection + recognition) | ~1.5 GB | OCR on scanned PDFs and images — 90+ languages, auto-multilingual |
-| NLLB-200-distilled-600M | ~1.2 GB | Offline translation, 200 languages → English |
+| Helsinki-NLP/opus-mt-mul-en | ~300 MB | Offline translation, 50+ languages → English |
 
 **Surya OCR advantages over EasyOCR:**
 - Handles handwritten text, printed text, and mixed documents
@@ -266,6 +266,6 @@ package.json               Node deps
 - Recognises Indic scripts (Hindi, Gujarati, Marathi, Bengali, Tamil, Telugu, etc.) trained on real documents, not just synthetic fonts
 - Better accuracy on low-quality scans, stamps, and mixed layouts
 
-**Translation speed (CPU):** ~15–40 s per page (translation only). OCR adds ~2–6 min per dense scanned page on CPU. A GPU reduces both to under 30 s total.
+**Translation speed (CPU):** ~5–15 s per page (translation only). OCR adds ~2–6 min per dense scanned page on CPU.
 
 **OCR accuracy:** 85–95% on typed/printed scans · 60–80% on handwritten text (significantly better than EasyOCR's 20–50%).

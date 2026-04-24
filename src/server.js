@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const express = require('express');
 const axios = require('axios');
 const translateRouter = require('./routes/translate');
@@ -31,6 +31,23 @@ app.use((err, req, res, next) => {
   return res.status(500).json({ success: false, error: err.message });
 });
 
+function killPort5000() {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync('netstat -ano', { encoding: 'utf8', timeout: 5000 });
+      const match = out.match(/127\.0\.0\.1:5000\s+\S+\s+LISTENING\s+(\d+)/);
+      if (match && match[1] !== '0') {
+        execSync(`taskkill /PID ${match[1]} /F`, { timeout: 5000 });
+        console.log(`[server] Freed port 5000 (killed PID ${match[1]})`);
+      }
+    } else {
+      execSync('fuser -k 5000/tcp 2>/dev/null || true', { timeout: 5000 });
+    }
+  } catch {
+    // port was already free or kill failed — proceed anyway
+  }
+}
+
 function startPythonService() {
   const py = spawn(
     PYTHON_PATH,
@@ -50,7 +67,7 @@ function startPythonService() {
   return py;
 }
 
-async function waitForPythonReady(maxMs = 120_000) {
+async function waitForPythonReady(maxMs = 300_000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     try {
@@ -60,14 +77,15 @@ async function waitForPythonReady(maxMs = 120_000) {
       await new Promise((r) => setTimeout(r, 2000));
     }
   }
-  throw new Error('Python FastAPI service did not become ready within 120s.');
+  throw new Error('Python FastAPI service did not become ready within 5 minutes.');
 }
 
 (async () => {
+  killPort5000();
   console.log('[server] Starting Python FastAPI service...');
   startPythonService();
 
-  console.log('[server] Waiting for Surya OCR + NLLB-200 to load (may take ~60s on first run)...');
+  console.log('[server] Waiting for Surya OCR + opus-mt to load (takes ~1-2 min on CPU)...');
   await waitForPythonReady();
   console.log('[server] Python service ready.');
 

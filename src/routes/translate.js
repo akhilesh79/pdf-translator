@@ -104,13 +104,6 @@ router.post('/', upload.single('file'), async (req, res) => {
     const status = err.response?.status;
     const data = err.response?.data;
 
-    if (status === 429 || data?.code === 'QUOTA_EXCEEDED') {
-      return res.status(429).json({
-        success: false,
-        code: 'QUOTA_EXCEEDED',
-        error: data?.error || 'MyMemory daily translation quota exhausted.',
-      });
-    }
     if (status === 422) {
       return res.status(422).json({ success: false, error: data?.detail || 'Could not extract text from file.' });
     }

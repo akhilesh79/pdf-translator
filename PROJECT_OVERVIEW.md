@@ -128,7 +128,7 @@ Handles `POST /api/translate`. Validates, caches, and orchestrates — no ML wor
 
 ### `src/utils/pythonClient.js` — HTTP Bridge to Python
 
-- `forwardToPython()` — streams file + lang field to `http://127.0.0.1:5000/process`, 180 s timeout
+- `forwardToPython()` — streams file + lang field to `http://127.0.0.1:5000/process`, 300 s timeout
 - `checkPythonHealth()` — GETs `/health`, used for startup polling and the `/health` route
 
 ---
@@ -227,28 +227,28 @@ Uses `langdetect` (Naive Bayes on character n-grams) on the first 4000 chars of 
 
 ---
 
-### `src/python/translator.py` — NLLB-200 Translation Engine
+### `src/python/translator.py` — opus-mt Translation Engine
 
-#### Why NLLB-200?
+#### Why Helsinki-NLP/opus-mt-mul-en?
 
 | Option | Problem |
 |--------|---------|
 | Google Translate API | Costs money, needs internet, API key |
 | MyMemory API | 5K chars/day limit, needs internet |
-| Helsinki-NLP opus-mt | One model per language pair — 50+ models needed |
-| **NLLB-200** | One model, 200 languages, fully offline, free forever |
+| NLLB-200-distilled-600M | 600M params × 4 bytes = 2.4 GB — OOM on 6 GB systems after Surya (1.5 GB) loads |
+| **opus-mt-mul-en** | 78M params (~300 MB), 50+ languages, fully offline, fits in RAM alongside Surya |
 
 #### Key implementation details
 
-**Dynamic int8 quantization** — converts `nn.Linear` weights from fp32 → int8, reducing memory from ~2.4 GB to ~800 MB and speeding up inference 2–3× on CPU.
+**MarianMT architecture** — Marian encoder-decoder (Helsinki-NLP), trained on OPUS data.
 
-**`_chunk_by_paragraph(text)`** — splits text into ≤ 300-word chunks to fit NLLB's 1024-token limit.
+**Auto language detection** — the model infers the source language from the text; no prefix tokens required.
 
-**Batched inference** — all chunks passed to `model.generate()` in one call. Sequential: 3 × 35s = 105s. Batched: ~40–50s.
+**`_chunk_by_paragraph(text)`** — splits text into ≤ 300-word chunks to fit MarianMT's 512-token limit.
+
+**Batched inference** — all chunks passed to `model.generate()` in one call.
 
 **`num_beams=1`** — greedy decoding. Near-identical quality to beam search at 4× the speed for factual text.
-
-**`forced_bos_token_id`** — forces the output to start with the English language token `eng_Latn`, locking output to English regardless of input language.
 
 ---
 
@@ -298,7 +298,7 @@ Pydantic model used by FastAPI to validate and serialise the `process_file()` re
 |-------|---------------|------|
 | Surya detection | `%LOCALAPPDATA%\datalab\datalab\Cache\models\text_detection\` | ~74 MB |
 | Surya recognition | `%LOCALAPPDATA%\datalab\datalab\Cache\models\text_recognition\` | ~1.4 GB |
-| NLLB-200-distilled-600M | `.hf_cache/hub/models--facebook--nllb-200-distilled-600M/` | ~1.2 GB |
+| Helsinki-NLP/opus-mt-mul-en | `.hf_cache/hub/models--Helsinki-NLP--opus-mt-mul-en/` | ~300 MB |
 
 ---
 
@@ -332,15 +332,15 @@ node src/server.js
     │       ├── FoundationPredictor()      ← 1.4 GB recognition base model
     │       ├── RecognitionPredictor(...)  ← wires detection + recognition
     │       └── load_nllb_model()
-    │               ├── AutoTokenizer + AutoModelForSeq2SeqLM
-    │               └── quantize_dynamic() ← int8 optimisation
+    │               ├── MarianTokenizer (Helsinki-NLP/opus-mt-mul-en)
+    │               └── MarianMTModel.from_pretrained() ← ~300 MB
     │
-    ├── every 2s: GET /health  ... waiting ~20–60s ...
+    ├── every 2s: GET /health  ... waiting ~30–90s ...
     │
     └── app.listen(3000) → "PDF Translator API running on port 3000"
 ```
 
-Total startup: **20–60 s** (models cached from second run onward).
+Total startup: **~1 min** (models cached from second run onward; first run downloads ~1.8 GB).
 
 ---
 
@@ -348,13 +348,13 @@ Total startup: **20–60 s** (models cached from second run onward).
 
 | Scenario | Typical Time |
 |----------|-------------|
-| Digital PDF, any language, 1 page | 15–40 s (translation only) |
+| Digital PDF, any language, 1 page | 5–15 s (translation only) |
 | Scanned PDF — printed text, 1 page | 2–4 min (Surya + translation) |
 | Scanned PDF — handwritten, 1 page | 3–6 min (Surya + translation) |
 | English document | < 1 s (passthrough, no translation) |
 | Same file uploaded again | < 50 ms (LRU cache hit) |
 
-**Bottleneck:** Surya recognition runs each detected text region through the transformer sequentially on CPU. GPU reduces this to seconds.
+**Bottleneck:** Surya recognition runs each detected text region through the transformer sequentially on CPU.
 
 ---
 
@@ -362,7 +362,7 @@ Total startup: **20–60 s** (models cached from second run onward).
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `timeout of 180000ms exceeded` | Dense page took > 3 min on CPU | Increase timeout in `pythonClient.js` or reduce image size |
+| `timeout of 300000ms exceeded` | Dense page took > 5 min on CPU | Reduce image DPI or page count |
 | `PDF rasterization failed` | Poppler not installed or not on PATH | Install Poppler, set `POPPLER_PATH` in `.env` |
 | `No text could be extracted` | Blank scan or all lines filtered as noise | Check scan quality |
 | `AttributeError: pad_token_id` | surya-ocr + transformers compat issue | Fixed by `surya_compat.apply()` — ensure it runs before any Surya import |

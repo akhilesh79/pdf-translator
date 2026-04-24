@@ -1,117 +1,118 @@
-# PDF Translator - Python Setup Guide
+# Python Setup Guide
 
-This application now uses Python for accurate PDF text extraction with OCR support. Follow these steps to set up Python.
+## Requirements
 
-## Step 1: Install Python
+- **Python 3.10–3.12** — PyTorch wheels are only available for these versions. Python 3.13+ is not supported.
+- **Poppler** — required by `pdf2image` to rasterise scanned PDF pages for OCR.
 
-### On Windows (Recommended)
+---
 
-1. Download Python from https://www.python.org/downloads/
-2. Run the installer
-3. **IMPORTANT**: Check "Add Python to PATH" during installation
-4. Verify installation by opening Command Prompt and running:
-   ```
-   python --version
-   ```
+## Step 1: Install Python 3.10–3.12
 
-### On macOS
+### Windows
 
-```bash
-brew install python3
+Download from https://www.python.org/downloads/ and install Python 3.12.
+
+**Important:** Check "Add Python to PATH" during installation.
+
+Verify:
+```
+python --version
 ```
 
-### On Linux (Ubuntu/Debian)
+### macOS
 
 ```bash
-sudo apt-get install python3 python3-pip
+brew install python@3.12
 ```
 
-## Step 2: Install Tesseract OCR
-
-### On Windows
-
-1. Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
-2. Run the installer (use default installation path: `C:\Program Files\Tesseract-OCR`)
-3. The script will automatically detect it
-
-### On macOS
+### Linux (Ubuntu/Debian)
 
 ```bash
-brew install tesseract
+sudo apt install python3.12 python3.12-pip
 ```
 
-### On Linux
+---
+
+## Step 2: Install Poppler
+
+Poppler converts scanned PDF pages to images so Surya OCR can read them.
+
+### Windows
+
+```
+winget install poppler
+```
+
+Or download from https://github.com/oschwartz10612/poppler-windows/releases, extract, and set `POPPLER_PATH` in `.env`:
+
+```
+POPPLER_PATH=C:\poppler\Library\bin
+```
+
+### macOS
 
 ```bash
-sudo apt-get install tesseract-ocr
+brew install poppler
 ```
+
+### Linux
+
+```bash
+sudo apt install poppler-utils
+```
+
+---
 
 ## Step 3: Install Python Packages
 
-In the project directory, run:
-
 ```bash
-pip install pdfplumber pytesseract pillow pdf2image
+pip install -r requirements.txt
 ```
 
-Or use:
+This installs (among others):
+
+| Package | Purpose |
+|---------|---------|
+| `surya-ocr` | Transformer-based OCR — 90+ languages, handles handwriting and scanned documents |
+| `torch` | Runs Surya OCR and opus-mt inference on CPU |
+| `transformers` | Loads and runs the Helsinki-NLP/opus-mt-mul-en translation model |
+| `pdfplumber` | Extracts text directly from digital PDFs |
+| `pdf2image` | Converts scanned PDF pages to images via Poppler |
+| `fastapi` + `uvicorn` | Python web service that Node.js talks to |
+| `langdetect` | Detects source language from extracted text |
+
+**Note:** `torch>=2.7.0,<2.11.0` is pinned — torch 2.11.0 has a known segfault with Surya's model loader on Windows CPU.
+
+---
+
+## Step 4: First Run — Model Downloads
+
+On the first `npm start`, two model sets download automatically:
+
+| Model | Cache Location | Size |
+|-------|---------------|------|
+| Surya OCR (detection + recognition) | `%LOCALAPPDATA%\datalab\datalab\Cache\models\` | ~1.5 GB |
+| Helsinki-NLP/opus-mt-mul-en | `.hf_cache/` in project root | ~300 MB |
+
+Total: ~1.8 GB. Allow 5–10 minutes on first run depending on connection speed. All subsequent starts load from disk in ~1 minute.
+
+---
+
+## Verify
 
 ```bash
-pip3 install pdfplumber pytesseract pillow pdf2image
+python -c "import surya, fastapi, uvicorn, pdfplumber, langdetect, transformers, torch; print('All OK')"
 ```
 
-## Step 4: Verify Setup
-
-After installing, test with:
-
-```bash
-python3 -c "import pdfplumber; import pytesseract; import pdf2image; print('All packages installed successfully!')"
-```
+---
 
 ## Troubleshooting
 
-### Tesseract not found on Windows
-
-If you get "tesseract is not installed" error, update the path in `src/services/pdf_extractor.py`:
-
-```python
-pytesseract.pytesseract.pytesseract_cmd = r'C:\Path\To\Your\Tesseract\tesseract.exe'
-```
-
-### pdfplumber errors
-
-Make sure you have Poppler installed:
-
-- **Windows**: Comes with pdf2image
-- **macOS**: `brew install poppler`
-- **Linux**: `sudo apt-get install poppler-utils`
-
-### Python not found in Node.js
-
-Make sure Python is in your system PATH and restart your terminal/IDE after installation.
-
-## How It Works
-
-1. User uploads PDF
-2. `translate.js` calls `extractTextPython()`
-3. Python script (`pdf_extractor.py`):
-   - Tries `pdfplumber` first (for digital PDFs)
-   - Falls back to OCR with `pytesseract` (for scanned PDFs)
-   - Returns JSON with extracted text, language, and page count
-4. Node.js processes the text for translation
-
-## Performance Notes
-
-- **Digital PDFs**: ~1-2 seconds per page (pdfplumber)
-- **Scanned PDFs**: ~5-10 seconds per page (OCR - slower)
-- **Mixed PDFs**: Automatic detection and appropriate method used
-
-## Next Steps
-
-After Python setup, start your server:
-
-```bash
-npm start
-```
-
-Upload a PDF via the API to test!
+| Error | Fix |
+|-------|-----|
+| `No module named 'torch'` | Run `pip install -r requirements.txt` |
+| `PDF rasterization failed` | Poppler not installed or `POPPLER_PATH` not set in `.env` |
+| `ModuleNotFoundError: No module named 'uvicorn'` | Wrong Python in PATH — set `PYTHON_PATH` in `.env` to the full interpreter path |
+| `Service exited with code 3221225477` | torch version incompatibility — ensure `torch>=2.7.0,<2.11.0` is installed |
+| Port 5000 already in use | Kill previous process: `netstat -ano \| findstr :5000` → `taskkill /PID <pid> /F` |

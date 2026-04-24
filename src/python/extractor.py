@@ -2,8 +2,8 @@ import io
 import os
 import re
 import sys
+import traceback
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import torch
 
@@ -16,9 +16,8 @@ from .translator import translate_to_english
 
 PDF_MAGIC = b"%PDF-"
 DIGITAL_TEXT_MIN_CHARS = 25
-OCR_BATCH_TIMEOUT_S = 600
-PDF_DPI = 150       # lower than default 200 — 44% fewer pixels, same OCR quality
-MAX_IMAGE_DIM = 1600  # cap longest side before Surya to bound inference time
+PDF_DPI = 150
+MAX_IMAGE_DIM = 1600
 
 
 # ---------------------------------------------------------------------------
@@ -106,16 +105,12 @@ def _run_surya(surya_models: dict, pil_images: list[Image.Image]) -> list[str]:
 
 
 def ocr_images(surya_models: dict, pil_images: list[Image.Image]) -> list[str]:
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(_run_surya, surya_models, pil_images)
-        try:
-            return future.result(timeout=OCR_BATCH_TIMEOUT_S)
-        except FutureTimeout:
-            print("[extractor] Surya OCR batch timed out", file=sys.stderr)
-            return []
-        except Exception as e:
-            print(f"[extractor] Surya OCR error: {e}", file=sys.stderr)
-            return []
+    try:
+        return _run_surya(surya_models, pil_images)
+    except Exception as e:
+        print(f"[extractor] Surya OCR error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return []
 
 
 # ---------------------------------------------------------------------------
