@@ -1,5 +1,6 @@
 import os
 import sys
+import torch
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile
@@ -52,6 +53,14 @@ async def lifespan(app: FastAPI):
     foundation = FoundationPredictor()
     det_predictor = DetectionPredictor()
     rec_predictor = RecognitionPredictor(foundation_predictor=foundation)
+
+    # GTX 1650 (Turing, no tensor cores) produces silent all-zero heatmaps in
+    # fp16, causing zero detections. Force fp32 on CUDA to restore correctness.
+    # Speed is still significantly faster than CPU despite no fp16 acceleration.
+    if torch.cuda.is_available():
+        det_predictor.model = det_predictor.model.float()
+        if hasattr(foundation, "model") and foundation.model is not None:
+            foundation.model = foundation.model.float()
 
     models["surya"] = {"det_predictor": det_predictor, "rec_predictor": rec_predictor}
     print("[python] Surya OCR ready.", file=sys.stderr)

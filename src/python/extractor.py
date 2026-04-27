@@ -4,6 +4,8 @@ import re
 import sys
 import traceback
 import unicodedata
+import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -237,6 +239,225 @@ def _ocr_pagelines_to_lines(
 
 
 # ---------------------------------------------------------------------------
+# Response-building helpers — map internal models → output schema
+# ---------------------------------------------------------------------------
+
+def _pages_from_lines(assembled_lines: list) -> list:
+    from .models import OcrPage
+    page_text: dict[int, list[str]] = defaultdict(list)
+    for page_num, _bbox, text in assembled_lines:
+        page_text[page_num].append(text)
+    return [
+        OcrPage(page_number=p, text="\n".join(lines))
+        for p, lines in sorted(page_text.items())
+    ]
+
+
+def _extract_ocr_tables(assembled_lines: list, is_scanned: bool) -> list:
+    """Reconstruct table structure from Surya bbox data using spatial column clustering.
+
+    Works by clustering text-line x0 values to find column boundaries, then
+    grouping lines that share similar y-coordinates into rows.
+    """
+    if not is_scanned:
+        return []
+
+    from .models import Table, TableCell
+
+    # Collect lines that have valid bboxes, grouped by page
+    by_page: dict[int, list[tuple[list[float], str]]] = defaultdict(list)
+    for page_num, bbox, text in assembled_lines:
+        if bbox and len(bbox) >= 4:
+            by_page[page_num].append((bbox, text))
+
+    tables: list[Table] = []
+
+    for page_num, lines in sorted(by_page.items()):
+        if len(lines) < 4:
+            continue
+
+        # --- Step 1: cluster x0 values into columns ---
+        x0_vals = sorted(set(round(b[0] / 10) * 10 for b, _ in lines))
+
+        col_clusters: list[list[float]] = []
+        current: list[float] = [x0_vals[0]]
+        for x in x0_vals[1:]:
+            if x - current[-1] <= 40:          # gap ≤ 40px → same column
+                current.append(x)
+            else:
+                col_clusters.append(current)
+                current = [x]
+        col_clusters.append(current)
+
+        if len(col_clusters) < 2:
+            continue                            # single-column page, not a table
+
+        # Column span: (start_x, end_x) with generous right margin
+        col_spans = [(min(c) - 20, min(c) + 200) for c in col_clusters]
+
+        def assign_col(x0: float) -> int:
+            for i, (lo, hi) in enumerate(col_spans):
+                if lo <= x0 <= hi:
+                    return i
+            # Fallback: nearest column centre
+            centres = [(lo + hi) / 2 for lo, hi in col_spans]
+            return min(range(len(centres)), key=lambda i: abs(x0 - centres[i]))
+
+        # --- Step 2: sort lines by y0, then cluster into rows ---
+        annotated = sorted(
+            [(bbox, text, assign_col(bbox[0])) for bbox, text in lines],
+            key=lambda t: t[0][1],
+        )
+
+        rows: list[list[tuple[list[float], str, int]]] = []
+        cur_row = [annotated[0]]
+        for item in annotated[1:]:
+            if abs(item[0][1] - cur_row[-1][0][1]) <= 12:   # same row if y within 12px
+                cur_row.append(item)
+            else:
+                rows.append(cur_row)
+                cur_row = [item]
+        rows.append(cur_row)
+
+        # --- Step 3: keep only rows that have ≥2 distinct columns populated ---
+        table_rows = [r for r in rows if len({item[2] for item in r}) >= 2]
+        if len(table_rows) < 2:
+            continue
+
+        cells: list[TableCell] = []
+        for row_idx, row in enumerate(table_rows):
+            for bbox, text, col_idx in row:
+                cells.append(TableCell(row=row_idx, col=col_idx, text=text))
+
+        tables.append(Table(
+            page=page_num,
+            rows=len(table_rows),
+            cols=len(col_clusters),
+            cells=cells,
+        ))
+
+    return tables
+
+
+def _build_extracted_fields(fields: list) -> dict:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for f in fields:
+        grouped[f.key].append(f.value)
+    return {k: (v[0] if len(v) == 1 else v) for k, v in grouped.items()}
+
+
+def _categorize_visuals(visual_elements: list):
+    from .models import VisualElementsBlock
+    return VisualElementsBlock(
+        stamps=[v for v in visual_elements if v.type == "stamp"],
+        signatures=[v for v in visual_elements if v.type == "signature"],
+        qr_codes=[v for v in visual_elements if v.type == "qr"],
+        barcodes=[v for v in visual_elements if v.type == "barcode"],
+        implant_stickers=[],
+    )
+
+
+def _derive_rule_checks(fields: list, flags: list[str], visual_elements: list) -> list:
+    from .models import RuleCheck
+    from .decision import REQUIRED_FIELDS
+
+    checks: list[RuleCheck] = []
+    by_key: dict[str, list] = defaultdict(list)
+    for f in fields:
+        by_key[f.key].append(f)
+
+    for req in sorted(REQUIRED_FIELDS):
+        flag_missing = f"Missing required field: {req}" in flags
+        flag_weak = f"Low-confidence required field: {req}" in flags
+        if flag_missing:
+            status, reason = "fail", f"Missing required field: {req}"
+        elif flag_weak:
+            status, reason = "conditional", f"Low-confidence required field: {req}"
+        else:
+            status, reason = "pass", None
+        checks.append(RuleCheck(
+            rule_id=f"required_field_{req}",
+            description=f"Required field present: {req.replace('_', ' ')}",
+            status=status, reason=reason,
+        ))
+
+    chrono = next((f for f in flags if "Chronology violation" in f), None)
+    checks.append(RuleCheck(
+        rule_id="chronology_check",
+        description="Discharge date is after admission date",
+        status="fail" if chrono else "pass", reason=chrono,
+    ))
+
+    tl = next((f for f in flags if "Timeline inconsistency" in f), None)
+    checks.append(RuleCheck(
+        rule_id="timeline_consistency",
+        description="Timeline events in logical order",
+        status="conditional" if tl else "pass", reason=tl,
+    ))
+
+    has_stamp = any(v.type == "stamp" for v in visual_elements)
+    checks.append(RuleCheck(
+        rule_id="hospital_stamp", description="Hospital stamp detected",
+        status="pass" if has_stamp else "fail",
+        reason=None if has_stamp else "No hospital stamp detected",
+    ))
+
+    has_sig = any(v.type == "signature" for v in visual_elements)
+    checks.append(RuleCheck(
+        rule_id="doctor_signature", description="Doctor signature detected",
+        status="pass" if has_sig else "fail",
+        reason=None if has_sig else "No signature detected",
+    ))
+    return checks
+
+
+def _derive_flag_items(flags: list[str]) -> list:
+    from .models import FlagItem
+    items: list[FlagItem] = []
+    for flag in flags:
+        if "Missing required field" in flag:
+            ftype, priority = "missing_field", "high"
+        elif "Low-confidence" in flag:
+            ftype, priority = "low_confidence", "medium"
+        elif "Chronology violation" in flag or "Timeline inconsistency" in flag:
+            ftype, priority = "date_inconsistency", "high"
+        elif "No hospital stamp" in flag:
+            ftype, priority = "missing_stamp", "medium"
+        elif "No signature" in flag:
+            ftype, priority = "missing_signature", "medium"
+        else:
+            ftype, priority = "general", "low"
+        items.append(FlagItem(type=ftype, priority=priority, message=flag))
+    return items
+
+
+def _derive_explainability(fields: list):
+    from .models import Explainability, EvidenceItem
+    evidence = [
+        EvidenceItem(field=f.key, value=f.value,
+                     page=f.source.page if f.source else None,
+                     bbox=f.source.bbox if f.source else None)
+        for f in fields if f.source
+    ]
+    score = round(sum(f.confidence for f in fields) / len(fields), 3) if fields else 0.0
+    return Explainability(confidence_score=score, evidence=evidence)
+
+
+def _derive_decision(verdict: str, flags: list[str]):
+    from .models import DecisionBlock
+    if verdict == "PASS":
+        reason, action = "All checks passed", "Approve claim"
+    elif verdict == "FAIL":
+        top = [f for f in flags if "Missing required field" in f or "Chronology" in f][:2]
+        reason = "; ".join(top) if top else (flags[0] if flags else "Validation failed")
+        action = "Reject — missing or invalid required information"
+    else:
+        reason = "; ".join(flags[:2]) if flags else "Conditional checks"
+        action = "Request additional documentation before approving"
+    return DecisionBlock(status=verdict, reason=reason, recommended_action=action)
+
+
+# ---------------------------------------------------------------------------
 # Result builder — takes structured per-page data, produces ProcessResponse dict
 # ---------------------------------------------------------------------------
 
@@ -297,8 +518,10 @@ def _build_result(
     digital_tables: list | None = None,
     pre_visuals: list | None = None,
     timings: dict | None = None,
+    source_type: str = "pdf",
 ) -> dict:
     import time as _t
+    from .models import Metadata, OcrBlock, LayoutBlock, RulesEngine
     timings = timings or {}
 
     if not assembled_lines:
@@ -345,7 +568,6 @@ def _build_result(
         print(f"[extractor] timeline build failed: {e}", file=sys.stderr)
     timings["timeline_ms"] = int((_t.perf_counter() - t0) * 1000)
 
-    # Visual detection only here if it wasn't already run in parallel with OCR.
     if not pre_visuals and pil_images:
         t0 = _t.perf_counter()
         try:
@@ -365,22 +587,39 @@ def _build_result(
 
     print(f"[extractor] timings: {timings}", file=sys.stderr)
 
+    avg_confidence = (
+        round(sum(f.confidence for f in fields) / len(fields), 3) if fields else None
+    )
+
+    ocr_tables = _extract_ocr_tables(assembled_lines, is_scanned)
+    all_tables = tables + ocr_tables
+
     return {
         "success": True,
-        "isScanned": is_scanned,
-        "pageCount": page_count,
-        "ocrLang": lang_arg if is_scanned else None,
-        "sourceLanguage": source_lang,
-        "engine": engine,
-        "originalText": cleaned_text,
-        "translatedText": translated,
-        "fields": [f.model_dump() for f in fields],
-        "tables": [t.model_dump() for t in tables],
-        "visual_elements": [v.model_dump() for v in visual_elements],
-        "timeline": [t.model_dump() for t in timeline],
-        "decision": decision_verdict,
-        "flags": flags,
-        "timings": timings,
+        "document_id": str(uuid.uuid4()),
+        "metadata": Metadata(
+            language=source_lang,
+            pages=page_count,
+            source_type=source_type,
+            is_scanned=is_scanned,
+            processing_time_ms=sum(timings.values()),
+        ),
+        "ocr": OcrBlock(
+            engine="surya" if is_scanned else "pdfplumber",
+            avg_confidence=avg_confidence,
+            original_text=cleaned_text,
+            translated_text=translated,
+        ),
+        "layout": LayoutBlock(tables=all_tables),
+        "extracted_fields": _build_extracted_fields(fields),
+        "visual_elements": _categorize_visuals(visual_elements),
+        "rules_engine": RulesEngine(
+            checks=_derive_rule_checks(fields, flags, visual_elements),
+        ),
+        "timeline": timeline,
+        "explainability": _derive_explainability(fields),
+        "flags": _derive_flag_items(flags),
+        "decision": _derive_decision(decision_verdict or "CONDITIONAL", flags),
     }
 
 
@@ -510,5 +749,5 @@ def _process_image(file_bytes: bytes, lang_arg: str, surya_models: dict, nllb_mo
 
     return _build_result(
         assembled, [capped], True, 1, lang_arg, nllb_model,
-        pre_visuals=pre_visuals, timings=timings,
+        pre_visuals=pre_visuals, timings=timings, source_type="image",
     )
